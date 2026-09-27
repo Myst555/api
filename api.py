@@ -6,10 +6,11 @@ import os
 import re
 import tempfile
 
+from firebase_service import send_push_notification
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any
 from pronunciation import analyze_pronunciation as analyze_pronunciation_text
 from transcribe import transcribe_audio_file
@@ -301,3 +302,32 @@ async def synthesize_speech(payload: SynthesizeRequest):
         media_type="audio/mpeg",
         filename="reference.mp3",
     )
+
+class NotificationRequest(BaseModel):
+    token: str
+    title: str
+    body: str
+    data: dict[str, str] = Field(default_factory=dict)
+
+
+@app.post("/test-notification")
+async def test_notification(request: NotificationRequest):
+    try:
+        message_id = send_push_notification(
+            token=request.token,
+            title=request.title,
+            body=request.body,
+            data=request.data,
+        )
+
+        return {
+            "success": True,
+            "message_id": message_id,
+        }
+
+    except Exception as exc:
+        _LOG.exception("notification_failed")
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )

@@ -1,14 +1,17 @@
-import json
+import mimetypes
 import os
 from typing import Optional
 
 import requests
 
+
 # Cloudflare configuration
 _CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
 _CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "")
-_WHISPER_MODEL = os.getenv("WHISPER_MODEL", "@cf/meta/whisper")
-_TRANSCRIBE_TIMEOUT_SECONDS = float(os.getenv("TRANSCRIBE_TIMEOUT_SECONDS", "60"))
+_WHISPER_MODEL = os.getenv("WHISPER_MODEL", "@cf/openai/whisper")
+_TRANSCRIBE_TIMEOUT_SECONDS = float(
+    os.getenv("TRANSCRIBE_TIMEOUT_SECONDS", "60")
+)
 
 
 def transcribe_audio_file(
@@ -19,60 +22,88 @@ def transcribe_audio_file(
     timeout_seconds: Optional[float] = None,
 ) -> dict:
     """
-    Transcribes audio using Cloudflare Workers AI (Whisper).
-    Acts as a drop-in replacement for the local faster-whisper implementation.
-    """
-    timeout = _TRANSCRIBE_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    Transcribe audio using Cloudflare Workers AI Whisper.
 
-    if not _CLOUDFLARE_ACCOUNT_ID or not _CLOUDFLARE_API_TOKEN:
+    The function keeps the same interface as the previous
+    faster-whisper implementation so api.py does not need
+    to change.
+    """
+
+    timeout = (
+        _TRANSCRIBE_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else timeout_seconds
+    )
+
+    if not _CLOUDFLARE_ACCOUNT_ID:
         raise RuntimeError(
-            "Cloudflare credentials not configured. "
-            "Set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN environment variables."
+            "CLOUDFLARE_ACCOUNT_ID is not configured."
         )
 
-    url = f"https://api.cloudflare.com/client/v4/accounts/{_CLOUDFLARE_ACCOUNT_ID}/ai/run"
+    if not _CLOUDFLARE_API_TOKEN:
+        raise RuntimeError(
+            "CLOUDFLARE_API_TOKEN is not configured."
+        )
+
+    # Cloudflare expects the model name in the URL.
+    url = (
+        f"https://api.cloudflare.com/client/v4/accounts/"
+        f"{_CLOUDFLARE_ACCOUNT_ID}/ai/run/{_WHISPER_MODEL}"
+    )
+
+    content_type = mimetypes.guess_type(audio_path)[0]
+
+    if not content_type:
+        content_type = "application/octet-stream"
 
     headers = {
         "Authorization": f"Bearer {_CLOUDFLARE_API_TOKEN}",
-        "cf-aig-gateway-id": "default",
-        "Content-Type": "application/json",
+        "Content-Type": content_type,
     }
 
-    # Read the audio file and convert to base64 for JSON transmission
-    import base64
     with open(audio_path, "rb") as audio_file:
-        audio_data = base64.b64encode(audio_file.read()).decode("utf-8")
-
-    payload = {
-        "model": _WHISPER_MODEL,
-        "input": {
-            "audio": audio_data,
-        },
-    }
-    
-    if language_hint:
-        payload["input"]["language"] = language_hint
+        audio_data = audio_file.read()
 
     response = requests.post(
         url,
         headers=headers,
-        data=json.dumps(payload),
+        data=audio_data,
         timeout=timeout,
     )
-    response.raise_for_status()
+
+    # Give us Cloudflare's actual error instead of only
+    # "400 Client Error".
+    if not response.ok:
+        try:
+            error_data = response.json()
+        except ValueError:
+            error_data = response.text
+
+        raise RuntimeError(
+            f"Cloudflare transcription failed "
+            f"(HTTP {response.status_code}): {error_data}"
+        )
+
     result = response.json()
 
-    # Cloudflare returns: {"result": {"text": "...", "language": "..."}, "success": true}
-    if not result.get("success"):
+    if not result.get("success", True):
         raise RuntimeError(
-            f"Cloudflare transcription failed: {result.get('errors', 'Unknown error')}"
+            f"Cloudflare transcription failed: "
+            f"{result.get('errors', 'Unknown error')}"
         )
 
     whisper_result = result.get("result", {})
-    return {
-        "language": whisper_result.get("language", "unknown"),
-        "language_probability": whisper_result.get("language_probability", 0.0),
-        "text": whisper_result.get("text", "").strip(),
-        "segments": [],  # Cloudflare Whisper doesn't return segments by default
-    }
 
+    text = whisper_result.get("text", "").strip()
+
+    words = whisper_result.get("words", [])
+
+    return {
+        "language": "en" if language_hint == "en" else "unknown",
+        "language_probability": 0.0,
+        "text": text,
+        "segments": [],
+        "words": words,
+        "word_count": whisper_result.get("word_count", len(words)),
+        "vtt": whisper_result.get("vtt", ""),
+    }
